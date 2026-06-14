@@ -20,6 +20,7 @@ jobs:
     outputs:
       targets: ${{ steps.matrix.outputs.targets }}
       packages: ${{ steps.matrix.outputs.packages }}
+      docker: ${{ steps.matrix.outputs.docker }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -44,10 +45,15 @@ jobs:
           targets="$(jq -c '[.[] | select(startswith("targz-")) | sub("^targz-"; "")]' <<<"$attrs")"
           # packages: {attr, target} so each can restore its target's caches.
           packages="$(jq -c '[.[] | select(startswith("deb-") or startswith("rpm-")) | {attr: ., target: sub("^(deb|rpm)-"; "")}]' <<<"$attrs")"
+          # docker: {attr, variant, target}. Variant names contain hyphens, so
+          # anchor the split on the known target tail rather than the first dash.
+          docker="$(jq -c '[.[] | capture("^docker-(?<variant>.+)-(?<target>linux-(amd64|arm64|s390x|armv7))$") | {attr: ("docker-" + .variant + "-" + .target), variant, target}]' <<<"$attrs")"
           echo "targets=$targets" >> "$GITHUB_OUTPUT"
           echo "packages=$packages" >> "$GITHUB_OUTPUT"
+          echo "docker=$docker" >> "$GITHUB_OUTPUT"
           echo "build targets: $targets"
           echo "package targets: $packages"
+          echo "docker targets: $docker"
 
   # Built ONCE (arch-independent), in parallel with the backends. Its cache is
   # reused by every tar/packages job via the merge below.
@@ -108,6 +114,17 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: nix build --print-build-logs ".#backend-$TARGET"
+      - name: Dump full nix build log on failure
+        if: failure()
+        env:
+          TARGET: ${{ matrix.target }}
+        run: nix log ".#backend-$TARGET" | tee build.log
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        if: failure()
+        with:
+          name: nix-log-backend-${{ matrix.target }}
+          path: build.log
+          retention-days: 3
       - name: Prove the binary targets ${{ matrix.target }}
         # On a Linux x86_64 host, `file` still identifies ELF arm64/riscv64/s390x,
         # PE32+ (Windows) and Mach-O (macOS) binaries — the cross-compile is real.
@@ -141,6 +158,17 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: nix build --print-build-logs ".#pkgtree-$TARGET"
+      - name: Dump full nix build log on failure
+        if: failure()
+        env:
+          TARGET: ${{ matrix.target }}
+        run: nix log ".#pkgtree-$TARGET" | tee build.log
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        if: failure()
+        with:
+          name: nix-log-pkgtree-${{ matrix.target }}
+          path: build.log
+          retention-days: 3
 
   # tar.gz per target. Depends ONLY on the package tree (a sibling of deb/rpm),
   # so it fans out in parallel with them. Tree + frontend + backend all come
@@ -170,6 +198,17 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: nix build --print-build-logs ".#targz-$TARGET"
+      - name: Dump full nix build log on failure
+        if: failure()
+        env:
+          TARGET: ${{ matrix.target }}
+        run: nix log ".#targz-$TARGET" | tee build.log
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        if: failure()
+        with:
+          name: nix-log-targz-${{ matrix.target }}
+          path: build.log
+          retention-days: 3
       - name: Stage artifact
         run: |
           mkdir -p dist
@@ -208,6 +247,17 @@ jobs:
         env:
           ATTR: ${{ matrix.pkg.attr }}
         run: nix build --print-build-logs ".#$ATTR"
+      - name: Dump full nix build log on failure
+        if: failure()
+        env:
+          ATTR: ${{ matrix.pkg.attr }}
+        run: nix log ".#$ATTR" | tee build.log
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        if: failure()
+        with:
+          name: nix-log-${{ matrix.pkg.attr }}
+          path: build.log
+          retention-days: 3
       - name: Stage artifact
         run: |
           mkdir -p dist
@@ -215,5 +265,88 @@ jobs:
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
         with:
           name: nix-${{ matrix.pkg.attr }}
+          path: dist
+          retention-days: 1
+
+  # OCI images via pkgs.dockerTools, one per (variant × arch). Depends only on
+  # pkgtree so backend+frontend+tree come from cachix — only the image layers
+  # are assembled here. 6 variants × 4 arches = 24 images.
+  docker:
+    name: ${{ matrix.img.attr }}
+    needs: [discover, pkgtree]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        img: ${{ fromJSON(needs.discover.outputs.docker) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31.10.6
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - uses: cachix/cachix-action@v17
+        with:
+          name: macabu
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      - name: Build the docker image
+        env:
+          ATTR: ${{ matrix.img.attr }}
+        run: nix build --print-build-logs ".#$ATTR"
+      - name: Dump full nix build log on failure
+        if: failure()
+        env:
+          ATTR: ${{ matrix.img.attr }}
+        run: nix log ".#$ATTR" | tee build.log
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        if: failure()
+        with:
+          name: nix-log-${{ matrix.img.attr }}
+          path: build.log
+          retention-days: 3
+      - name: Report closure size
+        env:
+          ATTR: ${{ matrix.img.attr }}
+        run: nix path-info --closure-size --human-readable ".#$ATTR"
+      # amd64 images run natively on the runner, so boot one and hit /api/health.
+      # Cross-arch images can't boot here without QEMU; they're validated by the
+      # build + docker load + architecture check below.
+      - name: Smoke test (docker load + boot)
+        env:
+          VARIANT: ${{ matrix.img.variant }}
+          TARGET: ${{ matrix.img.target }}
+        run: |
+          set -euo pipefail
+          img="$(docker load -q -i result/*.docker.tar.gz | sed -n 's/^Loaded image: //p' | head -1)"
+          echo "Loaded: $img"
+          docker inspect "$img" --format 'User={{.Config.User}} Arch={{.Architecture}} Entrypoint={{json .Config.Entrypoint}}'
+          if [ "$TARGET" != "linux-amd64" ]; then
+            echo "Cross-arch image — load + inspect only (no QEMU boot)."
+            exit 0
+          fi
+          cid="$(docker run -d -p 3000:3000 "$img")"
+          ok=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:3000/api/health >/dev/null; then ok=1; break; fi
+            sleep 2
+          done
+          # Shell variants have a usable `id`; distroless has no shell.
+          case "$VARIANT" in
+            distroless*) : ;;
+            *) echo "runtime id: $(docker exec "$cid" id || true)" ;;
+          esac
+          docker logs "$cid" | tail -50
+          docker rm -f "$cid" >/dev/null
+          test "$ok" = 1
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp -L result/*.docker.tar.gz dist/
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: nix-${{ matrix.img.attr }}
           path: dist
           retention-days: 1

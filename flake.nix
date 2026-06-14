@@ -103,6 +103,21 @@
       targzTargetName = mkTargetName "targz";
       debTargetName = mkTargetName "deb";
       rpmTargetName = mkTargetName "rpm";
+
+      # Docker images: linux only, and only arches we have a cross userland for
+      # (amd64, arm64, s390x, armv7 — matches the publish matrices). arm v6 and
+      # riscv64 are excluded.
+      dockerTargets = builtins.filter (
+        t: t.goos == "linux" && t.goarch != "riscv64" && !(t.goarch == "arm" && (t.goarm or "") == "6")
+      ) targets;
+      dockerVariants = [
+        "alpine"
+        "alpine-slim"
+        "ubuntu"
+        "ubuntu-slim"
+        "distroless"
+        "distroless-slim"
+      ];
     in
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -443,6 +458,230 @@
               cp ${filename} $out/${filename}
             '';
           };
+
+        # Container rootfs. Deliberately NOT mkPkgTree: that lays out the tarball
+        # (flat bin/, tools/, docs/, packaging/, VERSION); a container needs the
+        # /usr/share/grafana + /etc/grafana + /var layout the Dockerfile builds.
+        mkImageRoot =
+          {
+            goos,
+            goarch,
+            goarm ? null,
+            slim ? false,
+            ...
+          }:
+          let
+            backend = mkBackend { inherit goos goarch goarm; };
+          in
+          pkgs.stdenv.mkDerivation {
+            name = "grafana-image-root-${goos}-${mkArchLabel { inherit goarch goarm; }}${
+              pkgs.lib.optionalString slim "-slim"
+            }";
+            dontUnpack = true;
+            installPhase = ''
+              runHook preInstall
+
+              mkdir -p $out/usr/share/grafana/{bin,public,conf,.aws,data/plugins-bundled}
+              cp ${backend}/bin/${goos}/${goarch}/grafana $out/usr/share/grafana/bin/grafana
+              cp -r ${mkFrontend}/. $out/usr/share/grafana/public/
+              cp -r ${./conf}/. $out/usr/share/grafana/conf/
+              echo "${grafanaVersion}" > $out/.grafana-version
+
+              # conf/provisioning has no notifiers dir, so create all six explicitly.
+              mkdir -p $out/etc/grafana/provisioning/{datasources,dashboards,notifiers,plugins,access-control,alerting}
+              cp $out/usr/share/grafana/conf/sample.ini $out/etc/grafana/grafana.ini
+              cp $out/usr/share/grafana/conf/ldap.toml $out/etc/grafana/ldap.toml
+
+              mkdir -p $out/var/lib/grafana/plugins $out/var/log/grafana
+
+              # slim would skip copying bundled plugins; the flake bundles none
+              # today, so slim and full are identical for now.
+
+              runHook postInstall
+            '';
+          };
+
+        # OCI architecture string (Go GOARCH naming; dockerTools has no `variant`,
+        # so armv7 is just "arm").
+        dockerArch =
+          { goarch, ... }: goarch;
+
+        # The shell variants (alpine/ubuntu) need bash+coreutils for run.sh; those
+        # are arch-specific, so cross-compile them for non-amd64 targets. The
+        # static grafana binary itself comes from mkBackend, never rebuilt here.
+        crossPkgs =
+          {
+            goarch,
+            goarm ? null,
+            ...
+          }:
+          if goarch == "amd64" then
+            pkgs
+          else if goarch == "arm64" then
+            pkgs.pkgsCross.aarch64-multiplatform
+          else if goarch == "s390x" then
+            pkgs.pkgsCross.s390x
+          else if goarch == "arm" && goarm == "7" then
+            pkgs.pkgsCross.armv7l-hf-multiplatform
+          else
+            throw "no docker userland mapping for goarch=${goarch}";
+
+        # A single Docker image variant for one target.
+        mkDockerImage =
+          {
+            variant,
+            goos ? "linux",
+            goarch,
+            goarm ? null,
+            ...
+          }:
+          let
+            lib = pkgs.lib;
+            slim = lib.hasSuffix "-slim" variant;
+            base = lib.removeSuffix "-slim" variant;
+            isShell = base == "alpine" || base == "ubuntu";
+            imageRoot = mkImageRoot { inherit goos goarch goarm slim; };
+            cross = crossPkgs { inherit goarch goarm; };
+
+            # Non-root user without runAsRoot/KVM: ship /etc/passwd + /etc/group.
+            passwd = pkgs.writeTextDir "etc/passwd" ''
+              root:x:0:0:root:/root:/sbin/nologin
+              nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin
+              grafana:x:472:0::/usr/share/grafana:/bin/bash
+            '';
+            group = pkgs.writeTextDir "etc/group" ''
+              root:x:0:
+              nobody:x:65534:
+            '';
+
+            # Only these dirs must be writable by the grafana user at runtime.
+            writableDirs = lib.concatStringsSep " " [
+              "var/lib/grafana"
+              "var/lib/grafana/plugins"
+              "var/log/grafana"
+              "etc/grafana/provisioning"
+              "usr/share/grafana/.aws"
+              "usr/share/grafana/data/plugins-bundled"
+            ];
+
+            shellPath = lib.concatStringsSep ":" [
+              "/usr/share/grafana/bin"
+              "${cross.coreutils}/bin"
+              "${cross.gnugrep}/bin"
+              "${cross.gnused}/bin"
+              "${cross.bashInteractive}/bin"
+            ];
+
+            envCommon = [
+              "GF_PATHS_CONFIG=/etc/grafana/grafana.ini"
+              "GF_PATHS_DATA=/var/lib/grafana"
+              "GF_PATHS_HOME=/usr/share/grafana"
+              "GF_PATHS_LOGS=/var/log/grafana"
+              "GF_PATHS_PLUGINS=/var/lib/grafana/plugins"
+              "GF_PATHS_PROVISIONING=/etc/grafana/provisioning"
+              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+            ];
+          in
+          pkgs.dockerTools.buildLayeredImage {
+            name = "grafana";
+            tag = builtins.replaceStrings [ "+" ] [ "_" ] grafanaVersion;
+            architecture = dockerArch { inherit goarch; };
+            fromImage = null;
+            contents =
+              [
+                imageRoot
+                passwd
+                group
+                pkgs.cacert
+                pkgs.tzdata
+              ]
+              ++ lib.optionals isShell [
+                cross.bashInteractive
+                cross.coreutils
+                cross.gnugrep
+                cross.gnused
+              ];
+            # mkdir/chmod/cp/ln run as the build user (no fakeroot).
+            extraCommands =
+              ''
+                mkdir -p ${writableDirs}
+                chmod -R 0777 ${writableDirs}
+              ''
+              + lib.optionalString isShell ''
+                # The kernel reads run.sh's #!/bin/bash shebang literally, before
+                # PATH applies, so /bin/bash must physically exist.
+                mkdir -p bin
+                ln -s ${cross.bashInteractive}/bin/bash bin/bash
+                ln -s ${cross.bashInteractive}/bin/bash bin/sh
+                cp ${./packaging/docker/run.sh} run.sh
+                chmod 0755 run.sh
+              '';
+            # chown is only honoured under fakeroot (tar --numeric-owner records it).
+            fakeRootCommands = ''
+              chown -R 472:0 ${writableDirs}
+            '';
+            enableFakechroot = false;
+            config = {
+              User = "472";
+              WorkingDir = "/usr/share/grafana";
+              ExposedPorts = {
+                "3000/tcp" = { };
+              };
+              Labels = {
+                maintainer = "Grafana Labs <hello@grafana.com>";
+                "org.opencontainers.image.source" = "https://github.com/grafana/grafana";
+              };
+              Env = envCommon ++ [
+                "PATH=${if isShell then shellPath else "/usr/share/grafana/bin"}"
+              ];
+            }
+            // (
+              if isShell then
+                { Entrypoint = [ "/run.sh" ]; }
+              else
+                {
+                  Entrypoint = [
+                    "/usr/share/grafana/bin/grafana"
+                    "server"
+                    "--homepath=/usr/share/grafana"
+                    "--config=/etc/grafana/grafana.ini"
+                    "--packaging=docker"
+                  ];
+                  Cmd = [ "cfg:default.log.mode=console" ];
+                }
+            );
+          };
+
+        # Renames the buildLayeredImage output to the publish-pipeline filename.
+        mkDockerArtifact =
+          {
+            variant,
+            goos ? "linux",
+            goarch,
+            goarm ? null,
+            ...
+          }:
+          let
+            image = mkDockerImage { inherit variant goos goarch goarm; };
+            archLabel = mkArchLabel { inherit goarch goarm; };
+            # alpine full has no flavor token; everything else carries one.
+            suffix =
+              if variant == "alpine" then
+                ""
+              else if variant == "alpine-slim" then
+                "-slim"
+              else
+                ".${variant}";
+            filename = "grafana_${grafanaVersion}_${buildNumber}_${goos}_${archLabel}${suffix}.docker.tar.gz";
+          in
+          pkgs.stdenv.mkDerivation {
+            name = filename;
+            dontUnpack = true;
+            installPhase = ''
+              mkdir -p $out
+              cp ${image} $out/${filename}
+            '';
+          };
       in
       {
         packages =
@@ -478,6 +717,15 @@
               name = rpmTargetName t;
               value = mkRpm t;
             }) rpmTargets
+          )
+          // builtins.listToAttrs (
+            pkgs.lib.concatMap (
+              variant:
+              map (t: {
+                name = mkTargetName "docker-${variant}" t;
+                value = mkDockerArtifact (t // { inherit variant; });
+              }) dockerTargets
+            ) dockerVariants
           );
       }
     );
