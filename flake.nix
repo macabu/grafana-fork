@@ -99,6 +99,7 @@
         "${goarch}${nixpkgs.lib.optionalString (goarm != null) "-${goarm}"}";
 
       backendTargetName = mkTargetName "backend";
+      pkgtreeTargetName = mkTargetName "pkgtree";
       targzTargetName = mkTargetName "targz";
       debTargetName = mkTargetName "deb";
       rpmTargetName = mkTargetName "rpm";
@@ -454,6 +455,12 @@
           // {
             frontend = mkFrontend;
           }
+          // builtins.listToAttrs (
+            map (t: {
+              name = pkgtreeTargetName t;
+              value = mkPkgTree t;
+            }) targets
+          )
           // builtins.listToAttrs (
             map (t: {
               name = targzTargetName t;

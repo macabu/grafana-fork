@@ -113,10 +113,11 @@ jobs:
         # PE32+ (Windows) and Mach-O (macOS) binaries — the cross-compile is real.
         run: find -L result/bin -type f -name 'grafana*' -exec file -L {} +
 
-  # Assemble the tar.gz per target. MERGES the frontend cache + this target's
-  # backend cache, so neither is rebuilt — only the package tree and tar are.
-  tar:
-    name: tar.gz ${{ matrix.target }}
+  # Assemble the package tree per target, ONCE. Merges the frontend cache + this
+  # target's backend cache (neither rebuilt), then pushes the tree to cachix so
+  # the three sibling artifacts below each substitute it instead of rebuilding.
+  pkgtree:
+    name: pkgtree ${{ matrix.target }}
     needs: [discover, frontend, backend]
     runs-on: ubuntu-latest
     permissions:
@@ -136,10 +137,35 @@ jobs:
         with:
           name: macabu
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
-      - name: Build plan — frontend & backend FETCHED from cache, only tar BUILT
+      - name: Build the package tree
         env:
           TARGET: ${{ matrix.target }}
-        run: nix build --dry-run ".#targz-$TARGET"
+        run: nix build --print-build-logs ".#pkgtree-$TARGET"
+
+  # tar.gz per target. Depends ONLY on the package tree (a sibling of deb/rpm),
+  # so it fans out in parallel with them. Tree + frontend + backend all come
+  # from cachix — only the tar runs here.
+  tar:
+    name: tar.gz ${{ matrix.target }}
+    needs: [discover, pkgtree]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.discover.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31.10.6
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - uses: cachix/cachix-action@v17
+        with:
+          name: macabu
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
       - name: Build the tar.gz
         env:
           TARGET: ${{ matrix.target }}
@@ -154,11 +180,12 @@ jobs:
           path: dist
           retention-days: 1
 
-  # Native Linux packages (.deb / .rpm), in parallel. Merges this target's tar
-  # (package tree) + frontend + backend caches, so it only runs fpm.
+  # Native Linux packages (.deb / .rpm), in parallel with each other and with
+  # tar. Depends ONLY on the package tree (NOT on tar — deb/rpm never needed the
+  # tarball), so it only runs fpm against the cached tree.
   packages:
     name: ${{ matrix.pkg.attr }}
-    needs: [discover, tar]
+    needs: [discover, pkgtree]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -177,10 +204,6 @@ jobs:
         with:
           name: macabu
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
-      - name: Build plan — what the restored cache provides vs what must be built
-        env:
-          ATTR: ${{ matrix.pkg.attr }}
-        run: nix build --dry-run ".#$ATTR"
       - name: Build the package
         env:
           ATTR: ${{ matrix.pkg.attr }}
