@@ -1,0 +1,45 @@
+import { useEffect } from 'react';
+
+import type { SelectableValue } from '@grafana/data';
+import { config } from '@grafana/runtime';
+import { Text } from '@grafana/ui';
+import { contextSrv } from 'app/core/services/context_srv';
+import { getUserOrganizations, setUserOrganization } from 'app/features/org/state/actions';
+import { useDispatch, useSelector } from 'app/types/store';
+import { type UserOrg } from 'app/types/user';
+
+import { Branding } from '../../Branding/Branding';
+
+import { OrganizationSelect } from './OrganizationSelect';
+
+export function OrganizationSwitcher() {
+  const dispatch = useDispatch();
+  const orgs = useSelector((state) => state.organization.userOrgs);
+  const onSelectChange = async (option: SelectableValue<UserOrg>) => {
+    if (!option.value) {
+      return;
+    }
+    try {
+      // Await so /api/user/using/:orgId completes before navigation
+      await dispatch(setUserOrganization(option.value.orgId));
+    } catch {
+      // backendSrv shows the error toast; abort so we don't reload into the wrong org
+      return;
+    }
+    window.location.assign(`${config.appSubUrl}/?orgId=${option.value.orgId}`);
+  };
+  useEffect(() => {
+    if (
+      contextSrv.isSignedIn &&
+      !(contextSrv.user.authenticatedBy === 'apikey' || contextSrv.user.authenticatedBy === 'render')
+    ) {
+      dispatch(getUserOrganizations());
+    }
+  }, [dispatch]);
+
+  if (orgs?.length <= 1) {
+    return <Text truncate>{Branding.AppTitle}</Text>;
+  }
+
+  return <OrganizationSelect orgs={orgs} onSelectChange={onSelectChange} />;
+}
