@@ -217,6 +217,10 @@
           # Disabling the daemon keeps the build self-contained.
           NX_DAEMON = "false";
 
+          # Default V8 heap (~2GB) is too small for the webpack production build,
+          # which gets OOM-killed. Raise it; keep below the runner's RAM.
+          NODE_OPTIONS = "--max-old-space-size=8192";
+
           # Frontend output is static assets, skip the pointless strip pass.
           dontStrip = true;
 

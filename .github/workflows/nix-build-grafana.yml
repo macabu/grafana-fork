@@ -70,6 +70,15 @@ jobs:
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
       - name: Build .#frontend
         run: nix build --print-build-logs .#frontend
+      - name: Dump full frontend build log on failure
+        if: failure()
+        run: nix log .#frontend | tee frontend-build.log
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        if: failure()
+        with:
+          name: nix-frontend-build-log
+          path: frontend-build.log
+          retention-days: 3
       - name: Report closure size
         run: nix path-info --closure-size --human-readable .#frontend
 
