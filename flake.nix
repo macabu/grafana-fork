@@ -76,7 +76,7 @@
       ];
 
       debTargets = builtins.filter (t: t.goos == "linux") targets;
-      rpmTargets = builtins.filter (t: t.goos == "linux" && t.goarch != "arm") targets;
+      rpmTargets = builtins.filter (t: t.goos == "linux") targets;
 
       mkTargetName =
         prefix:
@@ -389,7 +389,11 @@
           in
           pkgs.stdenv.mkDerivation {
             name = filename;
-            nativeBuildInputs = [ pkgs.fpm ];
+            # fpm shells out to `rpmbuild` (from pkgs.rpm) to assemble the .rpm.
+            nativeBuildInputs = [
+              pkgs.fpm
+              pkgs.rpm
+            ];
             dontUnpack = true;
             buildPhase = ''
               mkdir -p pkg/usr/sbin
