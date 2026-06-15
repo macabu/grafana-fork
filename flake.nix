@@ -553,7 +553,7 @@
             passwd = pkgs.writeTextDir "etc/passwd" ''
               root:x:0:0:root:/root:/sbin/nologin
               nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin
-              grafana:x:472:0::/usr/share/grafana:/bin/bash
+              grafana:x:472:0::/usr/share/grafana:/sbin/nologin
             '';
             group = pkgs.writeTextDir "etc/group" ''
               root:x:0:
@@ -586,6 +586,11 @@
               "GF_PATHS_PLUGINS=/var/lib/grafana/plugins"
               "GF_PATHS_PROVISIONING=/etc/grafana/provisioning"
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+              # Real distro bases install tzdata at /usr/share/zoneinfo; pkgs.tzdata
+              # lands at /share/zoneinfo, which Go's time pkg won't find. Point Go
+              # (and glibc tools) at it explicitly so timezone-aware features work.
+              "ZONEINFO=${pkgs.tzdata}/share/zoneinfo"
+              "TZDIR=${pkgs.tzdata}/share/zoneinfo"
             ];
           in
           pkgs.dockerTools.buildLayeredImage {
