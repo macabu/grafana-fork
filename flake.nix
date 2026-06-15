@@ -474,9 +474,9 @@
             backend = mkBackend { inherit goos goarch goarm; };
           in
           pkgs.stdenv.mkDerivation {
-            name = "grafana-image-root-${goos}-${mkArchLabel { inherit goarch goarm; }}${
-              pkgs.lib.optionalString slim "-slim"
-            }";
+            name = "grafana-image-root-${goos}-${
+              mkArchLabel { inherit goarch goarm; }
+            }${pkgs.lib.optionalString slim "-slim"}";
             dontUnpack = true;
             installPhase = ''
               runHook preInstall
@@ -503,8 +503,7 @@
 
         # OCI architecture string (Go GOARCH naming; dockerTools has no `variant`,
         # so armv7 is just "arm").
-        dockerArch =
-          { goarch, ... }: goarch;
+        dockerArch = { goarch, ... }: goarch;
 
         # The shell variants (alpine/ubuntu) need bash+coreutils for run.sh; those
         # are arch-specific, so cross-compile them for non-amd64 targets. The
@@ -540,7 +539,14 @@
             slim = lib.hasSuffix "-slim" variant;
             base = lib.removeSuffix "-slim" variant;
             isShell = base == "alpine" || base == "ubuntu";
-            imageRoot = mkImageRoot { inherit goos goarch goarm slim; };
+            imageRoot = mkImageRoot {
+              inherit
+                goos
+                goarch
+                goarm
+                slim
+                ;
+            };
             cross = crossPkgs { inherit goarch goarm; };
 
             # Non-root user without runAsRoot/KVM: ship /etc/passwd + /etc/group.
@@ -593,33 +599,31 @@
             # (it would point at /nix/store/...-grafana-image-root/...). The
             # Dockerfile uses a real COPY, so we mirror that by copying imageRoot
             # into the layer as real files in extraCommands below.
-            contents =
-              [
-                passwd
-                group
-                pkgs.cacert
-                pkgs.tzdata
-              ]
-              ++ lib.optionals isShell [
-                cross.bashInteractive
-                cross.coreutils
-                cross.gnugrep
-                cross.gnused
-              ];
+            contents = [
+              passwd
+              group
+              pkgs.cacert
+              pkgs.tzdata
+            ]
+            ++ lib.optionals isShell [
+              cross.bashInteractive
+              cross.coreutils
+              cross.gnugrep
+              cross.gnused
+            ];
             # Runs as the build user (no fakeroot). cp -r preserves modes, so the
             # grafana binary keeps its exec bit and assets stay real files.
-            extraCommands =
-              ''
-                cp -r ${imageRoot}/. ./
-                chmod -R 0777 ${writableDirs}
-              ''
-              + lib.optionalString isShell ''
-                # bashInteractive is in `contents`, so /bin/bash (and /bin/sh)
-                # already exist via lndir; run.sh's #!/bin/bash shebang resolves
-                # to it. Just drop the entrypoint script at the image root.
-                cp ${./packaging/docker/run.sh} run.sh
-                chmod 0755 run.sh
-              '';
+            extraCommands = ''
+              cp -r ${imageRoot}/. ./
+              chmod -R 0777 ${writableDirs}
+            ''
+            + lib.optionalString isShell ''
+              # bashInteractive is in `contents`, so /bin/bash (and /bin/sh)
+              # already exist via lndir; run.sh's #!/bin/bash shebang resolves
+              # to it. Just drop the entrypoint script at the image root.
+              cp ${./packaging/docker/run.sh} run.sh
+              chmod 0755 run.sh
+            '';
             # chown is only honoured under fakeroot (tar --numeric-owner records it).
             fakeRootCommands = ''
               chown -R 472:0 ${writableDirs}
@@ -666,7 +670,14 @@
             ...
           }:
           let
-            image = mkDockerImage { inherit variant goos goarch goarm; };
+            image = mkDockerImage {
+              inherit
+                variant
+                goos
+                goarch
+                goarm
+                ;
+            };
             archLabel = mkArchLabel { inherit goarch goarm; };
             # alpine full has no flavor token; everything else carries one.
             suffix =
