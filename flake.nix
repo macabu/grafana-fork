@@ -616,6 +616,10 @@
             extraCommands = ''
               cp -r ${imageRoot}/. ./
               chmod -R 0777 ${writableDirs}
+              # dockerTools ships no /tmp; Grafana's plugin installer writes its
+              # download there. Real distro bases provide it (1777); recreate it.
+              mkdir -p tmp
+              chmod 1777 tmp
             ''
             + lib.optionalString isShell ''
               # bashInteractive is in `contents`, so /bin/bash (and /bin/sh)
