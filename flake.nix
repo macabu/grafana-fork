@@ -576,6 +576,8 @@
               "${cross.gnugrep}/bin"
               "${cross.gnused}/bin"
               "${cross.bashInteractive}/bin"
+              "${cross.curl}/bin"
+              "${cross.bubblewrap}/bin"
             ];
 
             envCommon = [
@@ -615,6 +617,10 @@
               cross.coreutils
               cross.gnugrep
               cross.gnused
+              # Parity with the alpine/ubuntu bases: curl (debugging/convenience)
+              # and bubblewrap (grafana's optional plugin sandbox execs `bwrap`).
+              cross.curl
+              cross.bubblewrap
             ];
             # Runs as the build user (no fakeroot). cp -r preserves modes, so the
             # grafana binary keeps its exec bit and assets stay real files.
@@ -632,6 +638,20 @@
               # to it. Just drop the entrypoint script at the image root.
               cp ${./packaging/docker/run.sh} run.sh
               chmod 0755 run.sh
+              # Loader-compat for dynamically-linked plugin backends: expose the
+              # ELF interpreters at their fixed paths so downloaded binaries can
+              # exec, mirroring upstream (alpine glibc-compat + ubuntu's `musl`).
+              #   - glibc: /lib64/ld-linux-x86-64.so.2, /lib/ld-linux-aarch64.so.1,
+              #     /lib/ld64.so.1, /lib/ld-linux-armhf.so.3; libs via LD_LIBRARY_PATH.
+              #   - musl:  /lib/ld-musl-<arch>.so.1 (the loader IS libc, self-contained).
+              # Real names are globbed (armv7's glibc loader isn't derivable) with an
+              # existence guard. distroless stays static-only, like upstream.
+              mkdir -p lib lib64
+              for f in ${cross.glibc}/lib/ld-*.so* ${cross.musl}/lib/ld-musl-*.so*; do
+                [ -e "$f" ] || continue
+                ln -s "$f" "lib/$(basename "$f")"
+                ln -s "$f" "lib64/$(basename "$f")"
+              done
             '';
             # chown is only honoured under fakeroot (tar --numeric-owner records it).
             fakeRootCommands = ''
@@ -648,9 +668,20 @@
                 maintainer = "Grafana Labs <hello@grafana.com>";
                 "org.opencontainers.image.source" = "https://github.com/grafana/grafana";
               };
-              Env = envCommon ++ [
-                "PATH=${if isShell then shellPath else "/usr/share/grafana/bin"}"
-              ];
+              Env =
+                envCommon
+                ++ (
+                  if isShell then
+                    [
+                      "PATH=${shellPath}"
+                      # Lets the standard ELF loader find glibc for dynamically-
+                      # linked plugin backends. Same glibc the nix userland links
+                      # against, so no version skew.
+                      "LD_LIBRARY_PATH=${cross.glibc}/lib"
+                    ]
+                  else
+                    [ "PATH=/usr/share/grafana/bin" ]
+                );
             }
             // (
               if isShell then
