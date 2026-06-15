@@ -587,9 +587,14 @@
             tag = builtins.replaceStrings [ "+" ] [ "_" ] grafanaVersion;
             architecture = dockerArch { inherit goarch; };
             fromImage = null;
+            # imageRoot is NOT in `contents`: contents are symlinked in via lndir,
+            # and Grafana's core-plugin finder resolves symlinks and rejects any
+            # public/app/plugins file whose real path escapes the plugins dir
+            # (it would point at /nix/store/...-grafana-image-root/...). The
+            # Dockerfile uses a real COPY, so we mirror that by copying imageRoot
+            # into the layer as real files in extraCommands below.
             contents =
               [
-                imageRoot
                 passwd
                 group
                 pkgs.cacert
@@ -601,18 +606,17 @@
                 cross.gnugrep
                 cross.gnused
               ];
-            # mkdir/chmod/cp/ln run as the build user (no fakeroot).
+            # Runs as the build user (no fakeroot). cp -r preserves modes, so the
+            # grafana binary keeps its exec bit and assets stay real files.
             extraCommands =
               ''
-                mkdir -p ${writableDirs}
+                cp -r ${imageRoot}/. ./
                 chmod -R 0777 ${writableDirs}
               ''
               + lib.optionalString isShell ''
-                # The kernel reads run.sh's #!/bin/bash shebang literally, before
-                # PATH applies, so /bin/bash must physically exist.
-                mkdir -p bin
-                ln -s ${cross.bashInteractive}/bin/bash bin/bash
-                ln -s ${cross.bashInteractive}/bin/bash bin/sh
+                # bashInteractive is in `contents`, so /bin/bash (and /bin/sh)
+                # already exist via lndir; run.sh's #!/bin/bash shebang resolves
+                # to it. Just drop the entrypoint script at the image root.
                 cp ${./packaging/docker/run.sh} run.sh
                 chmod 0755 run.sh
               '';
