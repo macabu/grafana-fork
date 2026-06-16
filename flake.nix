@@ -773,14 +773,20 @@
               value = mkRpm t;
             }) rpmTargets
           )
-          // builtins.listToAttrs (
-            pkgs.lib.concatMap (
-              variant:
-              map (t: {
-                name = mkTargetName "docker-${variant}" t;
-                value = mkDockerArtifact (t // { inherit variant; });
-              }) dockerTargets
-            ) dockerVariants
+          # Docker images are Linux artifacts (their userland pulls in Linux-only
+          # packages like bubblewrap/glibc/musl). Only expose them on Linux build
+          # hosts; on darwin the amd64 target's native userland would be darwin
+          # packages, which don't support these. CI builds on x86_64-linux.
+          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
+            builtins.listToAttrs (
+              pkgs.lib.concatMap (
+                variant:
+                map (t: {
+                  name = mkTargetName "docker-${variant}" t;
+                  value = mkDockerArtifact (t // { inherit variant; });
+                }) dockerTargets
+              ) dockerVariants
+            )
           );
       }
     );
